@@ -1,6 +1,6 @@
 # SysScope
 
-A compact, single-threaded Linux system monitor written in C++17. Reads real
+A compact Linux system monitor written in C++17. Reads real
 kernel counters through `/proc`; no runtime dependencies beyond the C++ standard
 library. The three commands cover live CPU/RAM monitoring, a process snapshot,
 and timestamped CSV collection.
@@ -38,6 +38,26 @@ and writes one row after each one-second interval: a 30-second run normally has
 30 data rows plus a header. Slow I/O can extend the elapsed time; missed deadlines
 do not cause bursts of catch-up samples. A sampling interval has no hard real-time
 guarantee.
+
+## Threading and synchronization
+
+`monitor` and `log` use a background `std::thread` to collect CPU/memory counters
+and calculate successive CPU samples. The main thread consumes complete snapshots
+and handles terminal or CSV output. `processes` remains a one-shot command.
+
+A `std::mutex` protects a single pending snapshot, the stop flag, and worker
+errors. A `std::condition_variable` coordinates delivery and interruptible waits.
+The worker waits when the slot is full, so slow output cannot overwrite unread
+measurements or grow an unbounded queue. File reads and output happen outside
+the shared-state lock. Each snapshot carries its collection timestamp.
+
+The sampler owns its thread through RAII: destruction requests stop, wakes any
+condition-variable wait, and joins the worker, including during exception
+unwinding. Worker exceptions are transferred to the main thread and reported
+through the normal CLI error path. Ctrl+C/SIGTERM set a lock-free atomic flag;
+the main thread polls at most every 100 ms while waiting for data and requests
+worker shutdown. A filesystem operation already in progress must finish before
+the worker can join.
 
 ## Measurements
 
@@ -82,15 +102,19 @@ enumerate `/proc` itself is reported as an error.
 
 ## Verification under Linux or WSL2
 
-The CTest suite includes portable parser/calculation/file tests and Linux-only
-checks that read live `/proc`, run the monitor/process commands, log two real
+The CTest suite includes portable parser/calculation/file and threading tests,
+plus Linux-only checks that read live `/proc`, run the monitor/process commands, log two real
 samples, and validate CSV row counts, CPU range, and memory arithmetic. It also
 checks `/dev/full` write failure handling. Test fixture values are used only in
 tests; application commands always read `/proc`.
 
+The threading tests cover repeated snapshot handoffs to a slower CSV consumer,
+timed waits, cancellation, worker exceptions, and joining during output-error
+unwinding. They use temporary `/proc` fixtures so they also run on Windows.
+
 Verified in the development environment: CMake build with GCC 15.2 on Windows,
-with the configured warnings enabled and no warnings emitted; all three native
-CTest checks passed. Live commands correctly reported unavailable `/proc`, and
+with the configured warnings enabled and no warnings emitted; all four native
+CTest checks passed. Threaded commands correctly reported unavailable `/proc`, and
 logging did not create an output file. Live Linux tests and real-measurement CSV
 collection have **not** been run here: the installed Docker WSL distribution has
 no compiler and the Docker engine is stopped.
@@ -119,6 +143,7 @@ Windows terminal, complete its setup, and install the packages listed above.
 ```text
 include/syscope.hpp      Metric types, parser/collector APIs, CPU sampler, CSV writer
 src/syscope.cpp          Collection, parsing, calculations, CSV serialization
+src/sampler.cpp          Sampling thread, synchronized handoff, cancellation, joining
 src/main.cpp             CLI validation, scheduling, terminal/process output
 tests/tests.cpp          Portable tests and live Linux checks
 tests/log_smoke.cmake    End-to-end CSV verification on Linux
@@ -135,7 +160,7 @@ tests/log_smoke.cmake    End-to-end CSV verification on Linux
 - Inside containers, `/proc` memory/CPU counters may describe the host or VM
   rather than cgroup limits. WSL2 reports its Linux VM, not Windows processes.
 - Standard ANSI terminal support is assumed for interactive screen redraws.
-- No GUI, worker threads, external libraries, or background daemon.
+- No GUI, external libraries, or background daemon.
 
 ## References
 

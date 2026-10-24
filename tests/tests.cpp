@@ -143,6 +143,82 @@ void core_tests() {
     check(stamp.size() == 20 && stamp[10] == 'T' && stamp.back() == 'Z', "UTC timestamp format incorrect");
 }
 
+syscope::Snapshot await_sample(syscope::Sampler& sampler) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (auto sample = sampler.next(std::chrono::milliseconds(20))) { return *sample; }
+    }
+    throw std::runtime_error("Timed out waiting for sampling thread");
+}
+
+void sampler_tests() {
+    using namespace std::chrono_literals;
+    Scratch scratch;
+    write_file(scratch.path / "stat", "cpu 100 0 100 800\n");
+    write_file(scratch.path / "meminfo", "MemTotal: 8192 kB\nMemAvailable: 2048 kB\n");
+    const syscope::ProcReader reader(scratch.path);
+    throws([&] { syscope::Sampler invalid(reader, 0ms); }, "Zero sampling interval accepted");
+    {
+        syscope::Sampler sampler(reader, 5ms);
+        const auto first = await_sample(sampler);
+        check(!first.cpu_percent && first.memory.used_kib() == 6144 && first.timestamp.size() == 20,
+              "Worker baseline snapshot incorrect");
+        syscope::CsvWriter csv(scratch.path / "threaded.csv");
+        for (int i = 0; i < 20; ++i) {
+            // Deliberately slower than the producer: exercises the bounded handoff.
+            std::this_thread::sleep_for(10ms);
+            const auto sample = await_sample(sampler);
+            check(sample.memory.total_kib == 8192 && sample.memory.available_kib == 2048,
+                  "Worker snapshot corrupted during handoff");
+            csv.write(sample.timestamp, sample.cpu_percent, sample.memory);
+        }
+        csv.close();
+        std::ifstream input(scratch.path / "threaded.csv");
+        std::string line;
+        int rows = 0;
+        while (std::getline(input, line)) { ++rows; }
+        check(rows == 21, "Threaded consumer lost CSV rows");
+        sampler.request_stop();
+        sampler.request_stop(); // Repeated cancellation must be harmless.
+    }
+    const auto start = std::chrono::steady_clock::now();
+    {
+        syscope::Sampler sleeper(reader, 1h);
+        await_sample(sleeper);
+        check(!sleeper.next(10ms), "Timed wait unexpectedly produced a sample");
+    } // Destruction must wake the worker instead of waiting for its one-hour interval.
+    check(std::chrono::steady_clock::now() - start < 2s, "Shutdown failed to wake sampling wait");
+    {
+        syscope::Sampler broken(syscope::ProcReader(scratch.path / "missing"), 5ms);
+        bool propagated = false;
+        try { broken.next(2s); }
+        catch (const std::runtime_error& error) {
+            propagated = std::string(error.what()).find("Cannot read") != std::string::npos;
+        }
+        check(propagated, "Worker startup error was not propagated");
+    }
+    {
+        syscope::Sampler broken(reader, 50ms);
+        await_sample(broken);
+        std::filesystem::remove(scratch.path / "meminfo");
+        bool propagated = false;
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!propagated && std::chrono::steady_clock::now() < deadline) {
+            try { broken.next(20ms); }
+            catch (const std::runtime_error&) { propagated = true; }
+        }
+        check(propagated, "Worker collection error was not propagated");
+    }
+    // Unwinding after an output error must also join a worker blocked on a full slot.
+    write_file(scratch.path / "meminfo", "MemTotal: 8192 kB\nMemAvailable: 2048 kB\n");
+    throws([&] {
+        syscope::Sampler sampler(reader, 5ms);
+        await_sample(sampler);
+        std::this_thread::sleep_for(30ms);
+        syscope::CsvWriter invalid(scratch.path / "missing" / "out.csv");
+    }, "Output failure was not propagated after worker cleanup");
+}
+
 void live_tests() {
 #ifdef __linux__
     const syscope::ProcReader reader;
@@ -168,6 +244,7 @@ void live_tests() {
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--live") { live_tests(); }
+        else if (argc == 2 && std::string(argv[1]) == "--sampler") { sampler_tests(); }
         else { core_tests(); }
         std::cout << "Tests passed\n";
         return 0;

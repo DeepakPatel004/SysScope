@@ -2,11 +2,16 @@
 
 #include <array>
 #include <cstdint>
+#include <chrono>
+#include <condition_variable>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <istream>
 #include <optional>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace syscope {
@@ -56,6 +61,35 @@ private:
 };
 
 std::string utc_timestamp();
+
+struct Snapshot {
+    std::string timestamp;
+    std::optional<double> cpu_percent;
+    Memory memory;
+};
+
+// One sampling thread and a bounded, single-slot handoff to the output thread.
+class Sampler {
+public:
+    explicit Sampler(ProcReader reader = ProcReader{},
+                     std::chrono::milliseconds interval = std::chrono::seconds(1));
+    ~Sampler();
+    Sampler(const Sampler&) = delete;
+    Sampler& operator=(const Sampler&) = delete;
+    // A timeout returns nullopt; a collection failure is rethrown on this thread.
+    std::optional<Snapshot> next(std::chrono::milliseconds timeout);
+    void request_stop();
+private:
+    void run() noexcept;
+    ProcReader reader_;
+    std::chrono::milliseconds interval_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::optional<Snapshot> pending_;
+    std::exception_ptr error_;
+    bool stopping_ = false;
+    std::thread worker_;
+};
 
 class CsvWriter {
 public:

@@ -1,6 +1,6 @@
 #include "syscope.hpp"
 
-#include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <csignal>
@@ -9,14 +9,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #ifdef __linux__
 #include <unistd.h>
 #endif
 
 namespace {
-volatile std::sig_atomic_t stopped = 0;
-void stop(int) { stopped = 1; }
+static_assert(std::atomic<bool>::is_always_lock_free, "Signal flag must be lock-free");
+std::atomic<bool> stopped{false};
+void stop(int) { stopped.store(true, std::memory_order_relaxed); }
 
 void usage() {
     std::cout << "SysScope - Linux CPU, memory, and process monitor\n\n"
@@ -77,9 +77,11 @@ bool terminal_output() {
 #endif
 }
 
-void display(std::optional<double> cpu, const syscope::Memory& memory, bool terminal) {
+void display(const syscope::Snapshot& sample, bool terminal) {
+    const auto& memory = sample.memory;
+    const auto cpu = sample.cpu_percent;
     if (terminal) { std::cout << "\033[2J\033[H"; }
-    std::cout << "SysScope | " << syscope::utc_timestamp() << " | Ctrl+C to stop\n"
+    std::cout << "SysScope | " << sample.timestamp << " | Ctrl+C to stop\n"
               << std::fixed << std::setprecision(1) << "CPU: ";
     if (cpu) { std::cout << *cpu << "%\n"; }
     else { std::cout << "N/A (collecting interval)\n"; }
@@ -92,15 +94,6 @@ void display(std::optional<double> cpu, const syscope::Memory& memory, bool term
         std::cout << "Swap (MiB): " << mib(*used) << " / " << mib(*memory.swap_total_kib) << '\n';
     } else { std::cout << "Swap: N/A\n"; }
     std::cout << '\n' << std::flush;
-}
-
-bool wait_until(std::chrono::steady_clock::time_point deadline) {
-    // Short sleeps keep Ctrl+C responsive without a worker thread.
-    while (!stopped && std::chrono::steady_clock::now() < deadline) {
-        const auto now = std::chrono::steady_clock::now();
-        std::this_thread::sleep_until(std::min(deadline, now + std::chrono::milliseconds(100)));
-    }
-    return !stopped;
 }
 
 void processes(const syscope::ProcReader& reader) {
@@ -116,25 +109,27 @@ void processes(const syscope::ProcReader& reader) {
 }
 
 void collect(const Options& config, const syscope::ProcReader& reader) {
-    syscope::CpuUsage usage_meter;
-    const auto initial = usage_meter.update(reader.cpu());
-    const auto initial_memory = reader.memory(); // Validate /proc before opening the CSV.
+    syscope::Sampler sampler(reader);
     std::optional<syscope::CsvWriter> csv;
     const bool terminal = terminal_output();
-    if (config.command == "log") { csv.emplace(config.output); }
-    else { display(initial, initial_memory, terminal); }
-
-    auto next = std::chrono::steady_clock::now();
-    for (int sample = 0; !config.duration || sample < *config.duration; ++sample) {
-        next += std::chrono::seconds(1);
-        if (!wait_until(next)) { break; }
-        const auto cpu = usage_meter.update(reader.cpu());
-        const auto memory = reader.memory();
-        if (csv) { csv->write(syscope::utc_timestamp(), cpu, memory); }
-        else { display(cpu, memory, terminal); }
-        // Slow I/O must not trigger a burst of catch-up samples.
-        next = std::max(next, std::chrono::steady_clock::now());
+    bool initial = true;
+    int collected = 0;
+    while (!stopped && (!config.duration || collected < *config.duration)) {
+        // Polling keeps signals responsive; worker cancellation uses the mutex.
+        const auto sample = sampler.next(std::chrono::milliseconds(100));
+        if (!sample) { continue; }
+        if (initial) {
+            // The worker validates /proc before the output file can be opened.
+            if (config.command == "log") { csv.emplace(config.output); }
+            else { display(*sample, terminal); }
+            initial = false;
+            continue;
+        }
+        if (csv) { csv->write(sample->timestamp, sample->cpu_percent, sample->memory); }
+        else { display(*sample, terminal); }
+        ++collected;
     }
+    sampler.request_stop();
     if (csv) {
         csv->close();
         std::cout << (stopped ? "Stopped; measurements saved to " : "Measurements saved to ")

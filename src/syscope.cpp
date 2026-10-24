@@ -210,13 +210,19 @@ std::vector<Process> ProcReader::processes() const {
 std::string utc_timestamp() {
     const auto now = std::chrono::system_clock::now();
     const auto time = std::chrono::system_clock::to_time_t(now);
-    const auto* utc = std::gmtime(&time); // Single-threaded application.
-    if (!utc) {
-        throw std::runtime_error("Cannot convert timestamp to UTC");
+    static std::mutex time_mutex;
+    std::tm utc{};
+    {
+        std::lock_guard<std::mutex> lock(time_mutex);
+        const auto* converted = std::gmtime(&time);
+        if (!converted) {
+            throw std::runtime_error("Cannot convert timestamp to UTC");
+        }
+        utc = *converted;
     }
     std::ostringstream output;
     output.imbue(std::locale::classic());
-    output << std::put_time(utc, "%Y-%m-%dT%H:%M:%SZ");
+    output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
     return output.str();
 }
 
